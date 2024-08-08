@@ -1,0 +1,177 @@
+/******************************************************************************
+*
+* The purpose of this scipt's DLL file is to apply external loads on the teeter
+* hinge of a two-bladed turbine to mimik a teeter brake by springs or hydraulic
+* dampers. The main parameters have to be definded in Bladed->Specify->
+* Additional Items->External Loads DLL->Additional Parameters and should look like:
+*
+MinRotorSpeed_rpm=2.4;
+-> Minimal rotation speed, as trigger to initialize the teeter brake.
+
+Load_Nm=1e8;
+-> The external load (here the moment in Nm around the teeter axis). (default for X2B teetering is 1e8 Nm)
+
+SpringAngle_deg=0.5;
+-> The teeter angle from 0 deg that is used as a spring to apply the load linearely until the specified load is reached.
+
+TimeToFullLoad_s=10;
+-> The transient time to apply the spezified load. Increases linearly by time from 0 until the specified load is reached.
+
+DamperGain=1;
+-> Gain of teeter angle damper. (default is X2B teetering is 1)
+*
+* If there are any questions, feel free to contact the author Fabian Anstock via fabian.anstock@haw-hamburg.de
+******************************************************************************/
+
+#include "ExternalLoadsDll.h" /**< this provides the definition of IExternalLoads_v3. */
+#include <codecvt>
+
+using namespace GHExternalLoads;
+double CurrentTime = 0;
+double BufferTime = 0;
+double LoadStartTime = 0;
+double TeeterAngle = 0;
+double TeeterVelocity = 0;
+int Trigger = 0;
+double Load = 0;
+double SpringAngle = 0 * 3.14159265359 / 180;
+double ProportionalLoad = 0;
+double DamperLoad = 0;
+double TimeToFullLoad = 0;
+double tLoad = 0; // applying load by time
+double tLoad_damper = 0; // applying damping load by time
+double DamperGain = 0;
+double AppliedLoad = 0;
+double RotorSpeed = 0;
+double MinRotorSpeed = 0;
+
+double GetValueFromSting(string strParam, string SearchString, IExternalLoads* ext_loads) {
+// function to tansfer the external input parameter to the variables
+	double IndxParamBegin = strParam.find(SearchString) + SearchString.length() + 1; // start index for value of search word (string start + length of string + 1 (for the "=") )
+	double IndxParamEnd = strParam.find(';', IndxParamBegin);								// end  index for value of search word ( the ";" after the found string)
+	if (strParam.find(SearchString) == std::string::npos) {
+		std::string message = "\n\n Could not find Parameter.\n Please add >>" + SearchString + "=Number;<<\n in Bladed->Specify->Additional Items->External Loads DLL->Additional Parameters \n\n";
+		ext_loads->ReportErrorMessage(message.c_str());
+	}
+	return std::stod(strParam.substr(IndxParamBegin, IndxParamEnd - IndxParamBegin)); // convert str to double
+}
+
+/// <summary>Initialise is called once at the start of the simulation. This is 
+/// intended as a point where the user can set up logging variables and initialise 
+/// their own code. Loads should not be applied during this call.</summary> 
+extern "C" void __declspec(dllexport) __cdecl Initialise_v3(GHExternalLoads::IInitialiseExternalLoads_v3* ext_loads) {
+	/* transfering the Additional Parameters to the variables */
+	ext_loads->SetLoggingLevel(GH_DISCON_LOG_INFO);
+	/**< This sets the threshhold of the logging so that Notes are displayed. */
+	wstring message = L"\n\nAdditional Parameters for External Load DLL:\n ";
+	message += ext_loads->GetAdditionalParameters();
+	//LoadStartTime = std::stod(ext_loads->GetAdditionalParameters());	
+	/**< This call reads in any additional external loads parameters specified for the run */
+	ext_loads->ReportInfoMessage(std::string(message.begin(), message.end()).c_str());
+	/**< This writes a Note to the console and the $ME file. */
+
+
+	std::wstring wide(ext_loads->GetAdditionalParameters());
+	std::string strParam(wide.begin(), wide.end());
+	// string SearchString = "StartTime";
+	// double IndxParamBegin = strParam.find(SearchString) + SearchString.length() + 1; // start index for value of search word (string start + length of string + 1 (for the "=") )
+	// double IndxParamEnd = strParam.find(';', IndxParamBegin);								// end  index for value of search word ( the ";" after the found string)
+	// LoadStartTime = std::stod(strParam.substr(IndxParamBegin, IndxParamEnd - IndxParamBegin)); // convert str to double
+
+	MinRotorSpeed  = GetValueFromSting(strParam, "MinRotorSpeed_rpm", ext_loads);
+	Load		   = GetValueFromSting(strParam, "Load_Nm", ext_loads);
+	SpringAngle    = GetValueFromSting(strParam, "SpringAngle_deg", ext_loads) * 3.14159265359 / 180;
+	TimeToFullLoad = GetValueFromSting(strParam, "TimeToFullLoad_s", ext_loads);
+	DamperGain     = GetValueFromSting(strParam, "DamperGain", ext_loads);
+
+	message = L"\n\tReading: \n\MinRotorSpeed_rpm=" + std::to_wstring(LoadStartTime) + L",\nLoad_Nm=" + std::to_wstring(Load)
+		+ L", \nSpringAngle_deg=" + std::to_wstring(SpringAngle) + L", \nTimeToFullLoad_s=" + std::to_wstring(TimeToFullLoad) + L", \nDamperGain=" + std::to_wstring(DamperGain);
+	ext_loads->ReportInfoMessage(std::string(message.begin(), message.end()).c_str());
+
+	/// Setting up logging: 
+	/**< This adds a logging variable 'Time', whose units are T (for Time). */
+	ext_loads->AddLogValue("LoadStartTime", "T");
+	ext_loads->AddLogValue("External Load in Nm", "FL");
+	ext_loads->AddLogValue("ProportionalLoad", "FL");
+	ext_loads->AddLogValue("DamperLoad", "FL");
+	ext_loads->ReportInfoMessage("Initialising external loads dll to mimik teeter brake...\n");
+}
+
+
+/// <summary>ApplyExternalLoads is called every time that loads are applied to 
+/// the multibody model - which includes the integrator's trial steps, which are 
+/// then ignored.</summary> 
+extern "C" void __declspec(dllexport) __cdecl ApplyExternalLoads_v3(GHExternalLoads::IApplyExternalLoads_v3* ext_loads) {
+	/* Applying the loads if the choosen minimum rotation speed is undercut. Note: TH stands for Teeter! */
+
+	TeeterAngle = ext_loads->GetMultibodyComponentStateValue("Teeter", 0);
+	TeeterVelocity = ext_loads->GetMultibodyComponentStateRate("Teeter", 0);
+
+	CurrentTime = ext_loads->GetSimulationCurrentTime();
+	RotorSpeed = ext_loads->GetMultibodyNodeAngularVelocity("GBL").x;
+	
+	if (RotorSpeed *30/3.141592 < MinRotorSpeed && CurrentTime > 1) {
+	// legacy: if (CurrentTime > LoadStartTime) {
+		if (Trigger == 0) {
+			wstring message = L"\n\nApplying load to teeter hinge TH at "
+				+ std::to_wstring(CurrentTime) + L" seconds\n";
+			ext_loads->ReportInfoMessage(std::string(message.begin(), message.end()).c_str());
+			// ext_loads->ReportInfoMessage("Applying load to blade");
+			Trigger = 1;
+			BufferTime = CurrentTime + 2;
+			LoadStartTime = CurrentTime;
+		}
+
+		// ramping up the load for smoother brake start until the full "Load" is reached 
+		tLoad = Load * fmin(1,  (CurrentTime - LoadStartTime) / TimeToFullLoad);
+
+		// reducing the spring angle over the time (WAS NOT REALLY USEFULL...)
+		// if (CurrentTime > TimeToFullLoad + LoadStartTime) SpringAngle = SpringAngle * (TimeToFullLoad + LoadStartTime) / CurrentTime;
+
+		// include damping:
+		//tLoad_damper = Load * fmin(1, ((CurrentTime - LoadStartTime) / TimeToFullLoad) / 5);
+		tLoad_damper = Load * fmin(1, (CurrentTime - LoadStartTime) / TimeToFullLoad);  // is now equal to tLoad...
+		// legacy: if (CurrentTime - LoadStartTime > TimeToFullLoad) DamperValue = fmin(Load, Load * ((CurrentTime - LoadStartTime) / (TimeToFullLoad)-1) / 5); else DamperValue = 0;
+
+		// applying a constant moment outside the spring angle. Inside spring angle the moment is proportional to the teeter angle.
+		// legacy: AppliedLoad = -tLoad * TeeterAngle / SpringAngle - DamperValue * TeeterVelocity * 180 / 3.141592;
+		ProportionalLoad = -tLoad * fmax(-1, fmin(1, TeeterAngle / SpringAngle));
+		DamperLoad = - tLoad_damper * TeeterVelocity * 180 / 3.141592 * DamperGain;
+
+		AppliedLoad = ProportionalLoad + DamperLoad;
+		if (AppliedLoad > tLoad) AppliedLoad = tLoad;
+		else if (AppliedLoad < -tLoad) AppliedLoad = -tLoad;
+
+		/*if      (TeeterAngle > SpringAngle)  tLoad = -tLoad;  // ext_loads->ApplyMultibodyNodeTorqueInLocalFrame("TH", "Teeter", DOF3(0, -tLoad, 0));
+		else if (TeeterAngle < -SpringAngle) tLoad =  tLoad;  // ext_loads->ApplyMultibodyNodeTorqueInLocalFrame("TH", "Teeter", DOF3(0, tLoad, 0));
+		else tLoad = - tLoad * TeeterAngle / SpringAngle; // ext_loads->ApplyMultibodyNodeTorqueInLocalFrame("TH", "Teeter", DOF3(0, -tLoad *TeeterAngle/SpringAngle, 0));
+		ext_loads->ApplyMultibodyNodeTorqueInLocalFrame("TH", "Teeter", DOF3(0, tLoad, 0));*/
+
+		ext_loads->ApplyMultibodyNodeTorqueInLocalFrame("TH", "Teeter", DOF3(0, AppliedLoad, 0));
+	}
+	else {
+		if (CurrentTime > BufferTime) Trigger = 0;
+		AppliedLoad = AppliedLoad * 0.99;
+	}
+
+	//DOF3 position = ext_loads->GetMultibodyNodePosition("TT"); 
+	/**< This interrogates the multibody model for the position of node 'TT'.
+	An error will be raised if there is no node of this name. */
+}
+/// <summary>StepComplete is called once the integrator has found a consistent 
+/// state for the model. This can be used to interrogate the model, but should 
+/// not be used for logging or applying loads</summary> 
+extern "C" void __declspec(dllexport) __cdecl StepComplete_v3(GHExternalLoads::IStepCompleteExternalLoads_v3* ext_loads) {
+	/**< The multibody model can be interrogated. */
+	// GHExternalLoads::DOF3 position = ext_loads->GetMultibodyNodePosition("TT");
+	// SOMEHOW BLADED CRASHES WITHOUT THIS FUNCTION!!!
+}
+
+extern "C" void __declspec(dllexport) __cdecl LogResults_v3(GHExternalLoads::ILogResultsExternalLoads_v3* ext_loads) {
+	GHExchangeObject::ILog_Value *  ErrorCode3 = ext_loads->GetLogValue(1);
+	/* Setting the log values on each call of ApplyExternalLoads: (CAN BE SEEN IN THE RESULTS VIEWER!) */
+	ext_loads->SetLoggingValueByName("LoadStartTime", LoadStartTime);
+	ext_loads->SetLoggingValueByName("External Load in Nm", AppliedLoad);
+	ext_loads->SetLoggingValueByName("ProportionalLoad", ProportionalLoad);
+	ext_loads->SetLoggingValueByName("DamperLoad", DamperLoad);
+}
